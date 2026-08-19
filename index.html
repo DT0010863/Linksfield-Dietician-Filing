@@ -11,6 +11,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-firestore-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
 
@@ -174,6 +175,7 @@
       <button class="btn ghost small" id="btnExportBackup">Export backup</button>
       <button class="btn teal small" id="btnDailySheet">Daily batch entry</button>
       <button class="btn ghost small" id="btnImport">Import patients</button>
+      <button class="btn teal small" id="btnScanDoc">Scan document</button>
     </div>
   </header>
 
@@ -293,6 +295,40 @@
       <button class="btn ghost" id="cancelBatch">Cancel</button>
     </div>
     <div id="batchResult" style="font-size:0.82rem;color:var(--ink-soft);margin-top:8px;"></div>
+  </div>
+</div>
+
+<!-- Scan document overlay -->
+<div class="overlay" id="scanDocOverlay">
+  <div class="sheet" style="max-width:820px;">
+    <div class="sheet-head">
+      <h2>Scan document</h2>
+      <button class="close-x" id="closeScanDoc">&times;</button>
+    </div>
+    <p style="font-size:0.8rem;color:var(--ink-soft);margin-top:-6px;">
+      Take or upload a clear photo of a Consultation File page (a printed patient PDF page — not a handwritten sheet). The app reads it directly — nothing is sent anywhere.
+    </p>
+    <input type="file" id="scanDocFile" accept="image/*" capture="environment" style="margin-bottom:10px;display:block;">
+    <button class="btn teal" id="btnRunScan">Read document</button>
+    <div id="scanStatus" style="font-size:0.82rem;color:var(--ink-soft);margin-top:8px;"></div>
+
+    <div id="scanReview" style="display:none;margin-top:16px;">
+      <p style="font-size:0.78rem;color:var(--amber);background:#F6EEDD;border:1px solid #E4D3AA;border-radius:6px;padding:8px 10px;">
+        OCR isn't perfect — check every field and every row below before saving, especially numbers.
+      </p>
+      <div class="grid2" id="scanFields"></div>
+      <h3 style="font-family:'Source Serif 4',serif;font-size:1rem;margin:10px 0 6px;">Consultation Log rows found</h3>
+      <table class="log" id="scanLogTable">
+        <thead><tr><th style="width:16%">Date</th><th style="width:26%">ICD-10</th><th style="width:14%">Procedure</th><th style="width:20%">Dietician</th><th></th></tr></thead>
+        <tbody id="scanLogBody"></tbody>
+      </table>
+      <button class="btn ghost small" id="btnScanAddRow">+ Add row</button>
+      <div class="actions-row">
+        <button class="btn teal" id="btnSaveScan">Save this patient</button>
+        <button class="btn ghost" id="cancelScan">Cancel</button>
+      </div>
+      <div id="scanSaveResult" style="font-size:0.82rem;color:var(--ink-soft);margin-top:8px;"></div>
+    </div>
   </div>
 </div>
 
@@ -425,6 +461,191 @@ document.getElementById('btnSaveBatch').addEventListener('click', async ()=>{
   resultEl.textContent = `Added ${date} entries for ${count} patient${count!==1?'s':''}.`;
   renderAll();
   setTimeout(()=>document.getElementById('dailySheetOverlay').classList.remove('open'), 900);
+});
+
+/* ---------------- Scan document (OCR, no AI/Claude involved) ---------------- */
+const KNOWN_DIETICIANS = ['Melanie','Amy','Ruth','Iman','Annika'];
+
+document.getElementById('btnScanDoc').addEventListener('click', ()=>{
+  document.getElementById('scanDocFile').value = '';
+  document.getElementById('scanStatus').textContent = '';
+  document.getElementById('scanReview').style.display = 'none';
+  document.getElementById('scanSaveResult').textContent = '';
+  document.getElementById('scanDocOverlay').classList.add('open');
+});
+document.getElementById('closeScanDoc').addEventListener('click', ()=>document.getElementById('scanDocOverlay').classList.remove('open'));
+document.getElementById('cancelScan').addEventListener('click', ()=>document.getElementById('scanDocOverlay').classList.remove('open'));
+
+function parseScannedText(text){
+  const get = (label) => {
+    const re = new RegExp(label + '\\s*[:\\-]?\\s*([^\\n]+)', 'i');
+    const m = text.match(re);
+    return m ? m[1].trim().replace(/\s{2,}.*$/, '').trim() : '';
+  };
+
+  const account = (text.match(/Account\s*No\.?\s*[:\-]?\s*(\d{4,6})/i) || [])[1] || '';
+  const caseno = (text.match(/Case\s*No\.?\s*[:\-]?\s*(\S+)/i) || [])[1] || '';
+  const idnumber = (text.match(/ID\s*No\.?\s*[:\-]?\s*(\d{6,15})/i) || [])[1] || '';
+  const dobRaw = (text.match(/DOB\s*[:\-]?\s*([\d.\/\-]{6,10})/i) || [])[1] || '';
+  const ward = (text.match(/Ward\s*[:\-]?\s*([A-Za-z0-9 ]{1,15})/i) || [])[1] || '';
+  const doctor = (text.match(/Doctor\s*[:\-]?\s*([^\n]{2,40})/i) || [])[1] || '';
+  const medaid = (text.match(/Medical\s*Aid\s*[:\-]?\s*([^\n]{2,50})/i) || [])[1] || '';
+
+  // Name: "Patient Consultation File: Mr AP VAN DER MERWE" style line
+  let surname = '', firstname = '';
+  const nameMatch = text.match(/(?:Mr|Mrs|Miss|Ms|Master)\.?\s+([A-Z][A-Za-z]{0,4})\s+([A-Z][A-Za-z '\-]+)/);
+  if(nameMatch){
+    firstname = nameMatch[1].trim();
+    surname = nameMatch[2].trim().replace(/\s+/g,' ');
+    surname = surname.replace(/\b\w/g, c=>c.toUpperCase());
+  }
+
+  // DOB: convert DD.MM.YYYY -> YYYY-MM-DD
+  let dob = '';
+  const dobParts = dobRaw.match(/(\d{1,2})[.\/\-](\d{1,2})[.\/\-](\d{4})/);
+  if(dobParts) dob = `${dobParts[3]}-${dobParts[2].padStart(2,'0')}-${dobParts[1].padStart(2,'0')}`;
+
+  // Consultation log rows: lines starting with a date like "17 Aug 2026"
+  const rows = [];
+  const lines = text.split('\n');
+  const months = 'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec';
+  const dateLineRe = new RegExp(`(\\d{1,2})\\s+(${months})\\s+(\\d{4})\\s+(.+)`, 'i');
+  const monthMap = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+
+  lines.forEach(line=>{
+    const m = line.match(dateLineRe);
+    if(!m) return;
+    const isoDate = `${m[3]}-${monthMap[m[2].toLowerCase().slice(0,3)]}-${m[1].padStart(2,'0')}`;
+    let rest = m[4].trim();
+
+    let dietician = '';
+    for(const name of KNOWN_DIETICIANS){
+      const re = new RegExp('\\b'+name+'\\b', 'i');
+      if(re.test(rest)){ dietician = name; rest = rest.replace(re,'').trim(); break; }
+    }
+    const procMatch = rest.match(/(\d{2,3})\s*(\(first\))?/);
+    let procedure = '';
+    if(procMatch){
+      procedure = procMatch[1] + (procMatch[2] ? ' (first)' : '');
+      rest = rest.replace(procMatch[0], '').trim();
+    }
+    const icd10 = rest.replace(/[|,]+$/, '').trim();
+    rows.push({ date: isoDate, icd10, procedure: procedure.replace(/\s*\(first\)/,''), dietician });
+  });
+
+  return { account, surname, firstname, idnumber, dob, caseno, ward: ward.trim(), doctor: doctor.trim(), medaid: medaid.trim(), rows };
+}
+
+let scanParsedRows = [];
+
+document.getElementById('btnRunScan').addEventListener('click', async ()=>{
+  const fileInput = document.getElementById('scanDocFile');
+  const statusEl = document.getElementById('scanStatus');
+  if(!fileInput.files[0]){ statusEl.textContent = 'Choose a photo first.'; return; }
+  statusEl.textContent = 'Reading document… this can take 15–30 seconds.';
+  document.getElementById('scanReview').style.display = 'none';
+
+  try{
+    const result = await Tesseract.recognize(fileInput.files[0], 'eng', {
+      logger: m => {
+        if(m.status === 'recognizing text'){
+          statusEl.textContent = `Reading document… ${Math.round(m.progress*100)}%`;
+        }
+      }
+    });
+    const parsed = parseScannedText(result.data.text);
+    scanParsedRows = parsed.rows;
+    statusEl.textContent = parsed.account || parsed.surname
+      ? 'Done — review the fields below before saving.'
+      : "Couldn't confidently read the key fields — check carefully below, or retake the photo with better lighting/focus.";
+
+    document.getElementById('scanFields').innerHTML = `
+      ${scanField('account','Account no.', parsed.account)}
+      ${scanField('surname','Surname', parsed.surname)}
+      ${scanField('firstname','First name / initials', parsed.firstname)}
+      ${scanField('idnumber','ID number', parsed.idnumber)}
+      ${scanField('dob','DOB', parsed.dob, 'date')}
+      ${scanField('caseno','Case no.', parsed.caseno)}
+      ${scanField('ward','Ward', parsed.ward)}
+      ${scanField('doctor','Doctor', parsed.doctor)}
+      ${scanField('medaid','Medical aid', parsed.medaid)}
+    `;
+    renderScanLogRows();
+    document.getElementById('scanReview').style.display = 'block';
+  }catch(e){
+    statusEl.textContent = 'Could not read that image — try a clearer, well-lit photo.';
+  }
+});
+
+function scanField(name,label,val,type){
+  return `<div class="field"><label>${label}</label><input type="${type||'text'}" id="scanf_${name}" value="${(val||'').replace(/"/g,'&quot;')}"></div>`;
+}
+
+function renderScanLogRows(){
+  const tbody = document.getElementById('scanLogBody');
+  tbody.innerHTML = '';
+  scanParsedRows.forEach((row,i)=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input type="date" data-i="${i}" data-f="date" value="${row.date||''}"></td>
+      <td><input type="text" data-i="${i}" data-f="icd10" value="${(row.icd10||'').replace(/"/g,'&quot;')}"></td>
+      <td><input type="text" data-i="${i}" data-f="procedure" value="${(row.procedure||'').replace(/"/g,'&quot;')}"></td>
+      <td><input type="text" data-i="${i}" data-f="dietician" value="${(row.dietician||'').replace(/"/g,'&quot;')}" placeholder="Melanie"></td>
+      <td><button class="row-del" data-i="${i}">&times;</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+  tbody.querySelectorAll('input').forEach(inp=>{
+    inp.addEventListener('change', ()=>{
+      scanParsedRows[inp.dataset.i][inp.dataset.f] = inp.value;
+    });
+  });
+  tbody.querySelectorAll('.row-del').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      scanParsedRows.splice(parseInt(btn.dataset.i),1);
+      renderScanLogRows();
+    });
+  });
+}
+
+document.getElementById('btnScanAddRow').addEventListener('click', ()=>{
+  scanParsedRows.push({date:'',icd10:'',procedure:'',dietician:''});
+  renderScanLogRows();
+});
+
+document.getElementById('btnSaveScan').addEventListener('click', async ()=>{
+  const val = (name)=> document.getElementById('scanf_'+name).value.trim();
+  const account = val('account');
+  const resultEl = document.getElementById('scanSaveResult');
+  if(!account || !val('surname')){
+    resultEl.style.color = 'var(--brick)';
+    resultEl.textContent = 'Account number and surname are required.';
+    return;
+  }
+  const newRows = scanParsedRows
+    .filter(r=>r.date)
+    .map(r=>({ date:r.date, icd10:r.icd10||'', procedure: stripProcCode(r.procedure||''), dietician: defaultDietician(r.dietician||''), paid:false }));
+
+  if(patients[account]){
+    const existing = patients[account];
+    const existingDates = new Set(existing.log.map(r=>r.date));
+    let added = 0;
+    newRows.forEach(r=>{ if(!existingDates.has(r.date)){ existing.log.push(r); added++; } });
+    await savePatients();
+    resultEl.style.color = 'var(--teal-dark)';
+    resultEl.textContent = `Updated existing patient ${existing.surname} (${account}) — added ${added} new row${added!==1?'s':''}.`;
+  }else{
+    patients[account] = {
+      account, surname: val('surname'), firstname: val('firstname'), idnumber: val('idnumber'),
+      dob: val('dob'), caseno: val('caseno'), ward: val('ward'), doctor: val('doctor'), medaid: val('medaid'),
+      status: 'active', notes: '', log: newRows
+    };
+    await savePatients();
+    resultEl.style.color = 'var(--teal-dark)';
+    resultEl.textContent = `Created new patient ${val('surname')} (${account}) with ${newRows.length} row${newRows.length!==1?'s':''}.`;
+  }
+  renderAll();
+  setTimeout(()=>document.getElementById('scanDocOverlay').classList.remove('open'), 1200);
 });
 
 /* ---------------- Import ---------------- */
